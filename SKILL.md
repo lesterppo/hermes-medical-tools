@@ -1,6 +1,6 @@
 ---
 name: hermes-medical-tools
-description: Native Hermes medical research tools — PSPP, jmv/R, PubMed, trials, stats, EBM.
+description: Statistics tools for Hermes — PSPP, jmv/R, PubMed, EBM.
 version: 1.0.0
 author: lesterppo
 license: MIT
