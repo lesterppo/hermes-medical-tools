@@ -287,13 +287,25 @@ def med_pubmed(
                 return _ok({"pmid": pmid, "e": "not found"})
 
             title_el = article.find(".//ArticleTitle")
-            abstract_el = article.find(".//AbstractText")
             title = title_el.text if title_el is not None and title_el.text else ""
-            abstract = abstract_el.text if abstract_el is not None and abstract_el.text else ""
+            # Join ALL AbstractText nodes — structured abstracts
+            # (Background/Methods/Results/Conclusions) have several.
+            abstract_parts = []
+            for ab_el in article.findall(".//AbstractText"):
+                label = ab_el.get("Label")
+                txt = "".join(ab_el.itertext()).strip()
+                if txt:
+                    abstract_parts.append(f"{label}: {txt}" if label else txt)
+            abstract = " ".join(abstract_parts)
+            yr_el = article.find(".//PubDate/Year")
+            yr = yr_el.text if yr_el is not None else ""
+            jr_el = article.find(".//Journal/Title")
+            jr = jr_el.text if jr_el is not None else ""
 
             return _ok({
                 "pmid": pmid, "t": title[:400],
-                "ab": abstract[:600] if abstract else "",
+                "ab": abstract[:900] if abstract else "",
+                "yr": yr, "jr": jr,
             })
 
         # Search
@@ -341,8 +353,13 @@ def med_pubmed(
                 pid = pid_el.text if pid_el is not None else ""
                 title_el = art.find(".//ArticleTitle")
                 title = title_el.text[:300] if title_el is not None and title_el.text else ""
-                ab_el = art.find(".//AbstractText")
-                abstract = ab_el.text[:400] if ab_el is not None and ab_el.text else ""
+                ab_parts = []
+                for ab_el in art.findall(".//AbstractText"):
+                    label = ab_el.get("Label")
+                    txt = "".join(ab_el.itertext()).strip()
+                    if txt:
+                        ab_parts.append(f"{label}: {txt}" if label else txt)
+                abstract = " ".join(ab_parts)[:400]
                 yr_el = art.find(".//PubDate/Year")
                 yr = yr_el.text if yr_el is not None else ""
                 articles.append({
