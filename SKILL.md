@@ -1,13 +1,13 @@
 ---
 name: hermes-medical-tools
-description: Statistics tools for Hermes — PSPP, jmv/R, PubMed, EBM.
-version: 1.0.0
+description: Statistics tools for Hermes — PubMed, trials, EBM, power, PSPP, R.
+version: 2.0.0
 author: lesterppo
 license: MIT
 metadata:
   hermes:
     category: research
-    tags: [medical, statistics, pubmed, clinical-trials, evidence-based-medicine, pspp, jamovi]
+    tags: [medical, statistics, pubmed, clinical-trials, evidence-based-medicine, pspp, jamovi, sample-size]
 ---
 
 # Hermes Medical Tools Skill
@@ -16,44 +16,75 @@ metadata:
 
 Load when the user asks for:
 - Statistical analysis of medical/clinical data
-- PubMed literature search
+- PubMed literature search (with retraction status)
 - Clinical trial lookup
-- Sample size or power calculation
-- Evidence-based medicine metrics (NNT, sensitivity, specificity)
+- Sample size / power / detectable-effect calculation
+- Evidence-based medicine metrics (NNT, NNH, sensitivity, specificity, LRs)
 - Any medical research task requiring statistics
 
-## How to Run
+## Install (plugin — survives `hermes update`)
 
-1. Install prerequisites (see README.md)
-2. Copy tools to `~/.hermes/hermes-agent/tools/`
-3. Add the `medical` toolset to `~/.hermes/hermes-agent/toolsets.py`
-4. Run `hermes tools enable medical`
-5. Start a new Hermes session
+```bash
+./install.sh                 # plugin install → ~/.hermes/plugins/hermes_medical_tools
+./install.sh --check         # backend availability only
+./install.sh --uninstall
+```
+
+Do **not** use `./install.sh --legacy`: copying into
+`~/.hermes/hermes-agent/tools/` is wiped by the next `hermes update` and leaves
+`Unknown toolsets: medical`. The installer also warns when another plugin
+already registers the same tool names (`med_pubmed`, `med_stats`, …), because
+duplicate registrations overwrite each other.
 
 ## Quick Reference
 
 | Task | Tool | Example |
 |------|------|---------|
-| t-test | pspp, jmv, med_stats | `pspp(syntax="T-TEST GROUPS=g(1 2) /VARIABLES=s.", data=...)` |
-| ANOVA | pspp, jmv, med_stats | `jmv(analysis="anovaOneW", data="grp,val\nA,10\nB,20\nC,30")` |
-| Regression | pspp, jmv | `jmv(analysis="linReg", data="x,y\n1,2\n2,3\n3,5")` |
-| Logistic regression | jmv | `jmv(analysis="logRegBin", data="y,x\n0,1\n0,2\n1,4\n1,5")` |
-| Descriptives | pspp, jmv | `jmv(analysis="descriptives", data="a,b,c\n1,2,3\n4,5,6")` |
-| Chi-square | pspp, jmv, med_stats | `jmv(analysis="contTables", data="tx,out\n1,1\n1,0\n0,1")` |
-| Correlation | jmv | `jmv(analysis="corrMatrix", data="x,y,z\n1,2,3\n2,3,1")` |
-| PubMed search | med_pubmed | `med_pubmed(q="metformin AND diabetes[TIAB]")` |
-| Clinical trials | med_trial | `med_trial(q="melanoma", status="recruiting")` |
-| Sample size | med_power | `med_power(calc="n", effect=0.5)` |
-| NNT, sens/spec | med_evidence | `med_evidence(tp=85, tn=90, fp=10, fn=15)` |
+| t-test (+ CI, Cohen's d) | med_stats | `med_stats(test="ttest", a=[120,125,130], b=[140,145,138])` |
+| ANOVA (+ eta²) | med_stats, jmv, pspp | `med_stats(test="anova", a=[[10,12],[20,22],[30,32]])` |
+| Chi-square / Fisher (+ OR, RR, Cramér's V) | med_stats | `med_stats(test="chisq", categorical=[[45,15],[10,30]])` |
+| Mann-Whitney / Kruskal-Wallis (+ effect size) | med_stats | `med_stats(test="mw", a=[1,2,3], b=[5,6,7])` |
+| Correlation (+ Fisher-z CI) | med_stats | `med_stats(test="pearson", a=[1,2,3,4,5], b=[2,3,5,4,6])` |
+| Regression / logistic | jmv, pspp | `jmv(analysis="linReg", data="x,y\n1,2\n2,3\n3,5")` |
+| SPSS syntax | pspp | `pspp(syntax="T-TEST GROUPS=g(1 2) /VARIABLES=s.", data=...)` |
+| PubMed search / fetch | med_pubmed | `med_pubmed(q="metformin diabetes[TIAB]", fetch=True)` |
+| Retraction check | med_pubmed | `med_pubmed(pmid="9500320")` → `warn: RETRACTED` |
+| Clinical trials | med_trial | `med_trial(q="inebilizumab", status="recruiting")` |
+| Sample size | med_power | `med_power(calc="n", effect=0.5, dropout=0.15)` |
+| Power for a given n | med_power | `med_power(calc="power", effect=0.5, n=30)` |
+| Detectable effect | med_power | `med_power(calc="detect", effect=0.5, n=20)` |
+| NNT / NNH with CI | med_evidence | `med_evidence(cer=0.15, eer=0.10)` |
+| Sens/spec/LR with CI | med_evidence | `med_evidence(tp=85, tn=90, fp=10, fn=15)` |
+
+## Reportable output
+
+Every test returns an **effect size and/or 95% CI next to the p-value**
+(Cohen's d, eta², rank-biserial, Cramér's V, OR/RR, Wilson intervals for
+proportions). A p-value alone is not reportable in a clinical manuscript —
+use these fields directly in the results table.
 
 ## Pitfalls
 
-1. **PSPP needs DATA LIST format** — not CSV. Use `DATA LIST FREE /var1 var2. BEGIN DATA ... END DATA.`
-2. **jmv needs CSV with header** — first row must be column names
-3. **med_stats ANOVA multi-group** — pass `a=[[g1],[g2],[g3]]` for 3+ groups
-4. **Service gating** — tools only appear when backend is installed. Run `hermes doctor` to check.
-5. **R packages** — jmv uses base R stats only. No heavy R package installs needed.
-6. **PSPP survival analysis** — PSPP supports SURVIVAL command but syntax is complex
+1. **`chisq` / `fisher` take `categorical` only** — do not pass `a=[]`;
+   `a` is optional for those tests (this used to fail).
+2. **NNT rounds up** (`int(1/ARR + 0.9999)`) so the number never under-powers
+   the estimate; `arr_ci`/`nnt_ci` assume n=100 per arm when only rates are
+   given (`n_assumed_per_arm` echoes the assumption).
+3. **`calc="power"` needs `n`** (per group). Passing n through `effect` still
+   works for backward compatibility but is deprecated.
+4. **Power is computed from the noncentral t**, not the normal approximation —
+   do not compare its numbers against normal-approximation calculators for
+   small n; this tool is the accurate one.
+5. **`dropout` inflates n before rounding** (`ceil(n/(1-dropout))`); report the
+   inflated figure in a protocol.
+6. **PSPP needs DATA LIST format**, not CSV: `DATA LIST FREE /a b. BEGIN DATA … END DATA.`
+7. **jmv needs CSV with a header row.**
+8. **Multi-group ANOVA/KW**: pass `a=[[g1],[g2],[g3]]`.
+9. **Service gating**: `pspp` needs the GNU PSPP binary, `jmv` needs `Rscript`,
+   `med_stats`/`med_power` need scipy. Unavailable tools simply are not exposed;
+   `./install.sh --check` tells you what is missing.
+10. **`med_trial` legacy code without `countTotal` reported `total: 0`** — fixed;
+    if you port this code elsewhere, keep `countTotal=true`.
 
 ## Credits
 

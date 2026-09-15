@@ -1,0 +1,14 @@
+name: hermes_medical_tools
+description: >-
+  Native, token-efficient medical research tools for Hermes Agent — PubMed
+  search (retraction-aware), ClinicalTrials.gov, quick statistics with effect
+  sizes and 95% CIs, exact sample-size/power calculation, EBM metrics with
+  confidence intervals, GNU PSPP subprocess (SPSS syntax) and R/jamovi-style
+  analyses. Registers the medical toolset: med_pubmed, med_trial, med_stats,
+  med_power, med_evidence, pspp, jmv.
+author: Peter (lesterppo)
+version: 2.0.0
+license: MIT
+kind: standalone
+tags: [medical, pubmed, clinical-trials, statistics, scipy, pspp, spss, jamovi, r, ebm, sample-size, power, evidence-based-medicine, hermes-agent, ai-agent]
+homepage: https://github.com/lesterppo/hermes-medical-tools
