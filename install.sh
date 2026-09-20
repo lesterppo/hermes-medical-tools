@@ -76,6 +76,11 @@ else
 fi
 if [ "$HAS_R" -eq 1 ]; then
     echo "  ✓ Rscript      — jamovi-compatible analyses"
+    if Rscript -e 'quit(status=as.integer(!requireNamespace("jsonlite", quietly=TRUE)))' >/dev/null 2>&1; then
+        echo "  ✓ jsonlite     — R JSON backend for jmv"
+    else
+        echo "  ✗ jsonlite     — install: Rscript -e 'install.packages(\"jsonlite\", repos=\"https://cloud.r-project.org\")'"
+    fi
 else
     echo "  ✗ Rscript      — install: sudo apt install r-base"
 fi

@@ -132,6 +132,49 @@ check("jmv_hint", "apt install r-base" in strict("x", jmv.jmv_run(analysis="desc
 check("pspp_san", strict("x", pspp._ok({"x": float("nan")})) == {"x": None})  # noqa: SLF001
 check("jmv_san", strict("x", jmv._ok({"x": float("inf")})) == {"x": None})  # noqa: SLF001
 
+# 11. McNemar paired sizing (Miettinen normal approx)
+d = strict("mcnemar_n", mt.med_power(calc="n", design="mcnemar", pdisc=0.3, oratio=2.0))
+check("mcnemar_n_vals", d and d.get("t") == "mcnemar" and d["n_pairs"] == 234 and d["n_discordant"] == 71, d)
+check("mcnemar_auto", strict("x", mt.med_power(calc="n", pdisc=0.3, oratio=2.0))["n_pairs"] == 234)
+check("mcnemar_dropout", strict("x", mt.med_power(calc="n", design="mcnemar", pdisc=0.3, oratio=2.0, dropout=0.2))["n_pairs"] == 293)
+check("mcnemar_ci", "or_ci" in d and d["or_ci"][0] < 2.0 < d["or_ci"][1], d)
+_p = strict("x", mt.med_power(calc="power", design="mcnemar", pdisc=0.3, oratio=2.0, n=234))["p"]
+check("mcnemar_roundtrip", abs(_p - 0.8) < 0.02, _p)
+_od = strict("x", mt.med_power(calc="detect", design="mcnemar", pdisc=0.3, n=234))["oratio"]
+check("mcnemar_detect", abs(_od - 2.0) < 0.05, _od)
+check("mcnemar_or1", "e" in strict("x", mt.med_power(calc="n", design="mcnemar", pdisc=0.3, oratio=1.0)))
+check("mcnemar_noparam", "e" in strict("x", mt.med_power(calc="n", design="mcnemar", pdisc=0.3)))
+
+# 12. log-rank survival sizing (Schoenfeld/Freedman)
+d = strict("logrank_n", mt.med_power(calc="n", design="logrank", hr=0.7, pevent=0.5))
+check("logrank_vals", d and d.get("t") == "logrank" and d["events"] == 247 and d["n_total"] == 494, d)
+_f = strict("x", mt.med_power(calc="n", design="logrank", hr=0.7, pevent=0.5, method="freedman"))
+check("logrank_freedman", _f["events"] == 253 and _f["events"] >= d["events"], (_f["events"], d["events"]))
+check("logrank_nopevent", "note" in strict("x", mt.med_power(calc="n", design="logrank", hr=0.7)))
+_p = strict("x", mt.med_power(calc="power", design="logrank", hr=0.7, events=247))["p"]
+check("logrank_roundtrip", abs(_p - 0.8) < 0.02, _p)
+check("logrank_npevent", abs(strict("x", mt.med_power(calc="power", design="logrank", hr=0.7, n=494, pevent=0.5))["p"] - 0.8) < 0.02)
+check("logrank_hr1", "e" in strict("x", mt.med_power(calc="n", design="logrank", hr=1.0)))
+check("logrank_badcalc", "e" in strict("x", mt.med_power(calc="detect", design="logrank", hr=0.7)))
+
+# 13. diagnostic-accuracy sizing (Wald normal approx)
+d = strict("acc_n", mt.med_power(calc="n", design="acc", sens=0.9, width=0.05, prev=0.2))
+check("acc_vals", d and d.get("t") == "accuracy" and d["n_diseased"] == 139 and d["n_total"] == 695, d)
+_b = strict("x", mt.med_power(calc="n", design="acc", sens=0.9, spec=0.85, width=0.05, prev=0.2))
+check("acc_both", _b["n_total"] == 695 and _b["n_total"] == max(_b["n_total_sens"], _b["n_total_spec"]) and _b["driven_by"] == "sens", _b)
+check("acc_dropout", strict("x", mt.med_power(calc="n", design="acc", sens=0.9, width=0.05, prev=0.2, dropout=0.1))["n_total"] == 773)
+check("acc_calc", "e" in strict("x", mt.med_power(calc="power", design="acc", sens=0.9, width=0.05, prev=0.2)))
+check("acc_noparam", "e" in strict("x", mt.med_power(calc="n", design="acc", sens=0.9)))
+
+# 14. registry handler forwards new params (no dropped params)
+_h = _reg.registry.get_entry("med_power").handler
+_d = json.loads(_h({"calc": "n", "design": "mcnemar", "pdisc": 0.3, "oratio": 2.0}))
+check("handler_mcnemar", _d.get("t") == "mcnemar" and _d["n_pairs"] == 234, _d)
+_d = json.loads(_h({"calc": "n", "design": "logrank", "hr": 0.7, "pevent": 0.5}))
+check("handler_logrank", _d.get("t") == "logrank" and _d["events"] == 247, _d)
+_d = json.loads(_h({"calc": "n", "design": "acc", "sens": 0.9, "width": 0.05, "prev": 0.2}))
+check("handler_acc", _d.get("t") == "accuracy" and _d["n_total"] == 695, _d)
+
 def test_regression():
     assert FAIL == 0, f"{FAIL} regression checks failed"
 

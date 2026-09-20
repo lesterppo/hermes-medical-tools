@@ -683,6 +683,17 @@ def med_power(
     p2: Optional[float] = None,
     n: Optional[int] = None,
     dropout: float = 0.0,
+    design: str = "auto",
+    pdisc: Optional[float] = None,
+    oratio: Optional[float] = None,
+    hr: Optional[float] = None,
+    pevent: Optional[float] = None,
+    events: Optional[int] = None,
+    method: str = "schoenfeld",
+    sens: Optional[float] = None,
+    spec: Optional[float] = None,
+    width: Optional[float] = None,
+    prev: Optional[float] = None,
 ) -> str:
     """
     Calculate sample size, power, or detectable effect for common designs.
@@ -692,11 +703,31 @@ def med_power(
              no `n`, this doubles as n per group.
     power:   target power (default 0.80)
     alpha:   significance level (default 0.05, two-sided)
-    ratio:   n2/n1 ratio (default 1 for equal groups)
+    ratio:   n2/n1 ratio (default 1 for equal groups; log-rank: allocation ratio)
     p1:      proportion in group 1 (proportion tests)
     p2:      proportion in group 2 (proportion tests)
-    n:       per-group n for calc="power" (exact noncentral-t power)
+    n:       per-group n for calc="power" (exact noncentral-t power).
+             McNemar: TOTAL pairs. Log-rank power: TOTAL N (needs pevent).
     dropout: expected attrition fraction (0.15 = 15%) — inflates the required n
+    design:  "auto" (infer from params) | "continuous" | "prop" | "mcnemar" | "logrank" | "acc"
+
+    Clinical sizing designs (normal approximations, documented below; the
+    continuous-d path stays exact noncentral-t):
+      mcnemar (paired binary): needs pdisc + oratio.
+        Miettinen normal approx: N_pairs = [z_a*sqrt(pd) + z_b*sqrt(pd-d^2)]^2 / d^2
+        with d = pd*|OR-1|/(OR+1). Assumes large-sample normality of the
+        discordant-difference; an exact unconditional test can differ at small m.
+      logrank (two-arm survival): needs hr; method="schoenfeld" (default) | "freedman".
+        Schoenfeld events E = (z_a+z_b)^2 / [q(1-q) (ln HR)^2], q = 1/(1+ratio);
+        Freedman replaces ln(HR) with 2(HR-1)/(HR+1). N = E/pevent.
+        Assumes proportional hazards with censoring/accrual summarized by pevent.
+        calc="power" needs events (or n+pevent for expected events).
+      acc (diagnostic accuracy, calc="n" only): needs sens and/or spec + width + prev.
+        Wald normal approx: n_se = z^2*s(1-s)/w^2, N = n_se/prev
+        (specificity: n_sp/(1-prev); both given -> max). Assumes the Wald
+        interval; a warn is added when s+-w leaves (0,1).
+    Effect+CI style: sizing outputs carry the expected 95% CI
+    (McNemar discordant-OR log CI; log-rank HR CI; accuracy Wald band).
     """
     try:
         from scipy import stats as sps
@@ -711,6 +742,231 @@ def med_power(
                 return n1, n1 + round(n1 * ratio)
             adj = int(np.ceil(n1 / (1 - dropout)))
             return adj, adj + round(adj * ratio)
+
+        if not (0 < float(power) < 1):
+            return _err("power must be strictly between 0 and 1")
+        if not (0 < float(alpha) < 1):
+            return _err("alpha must be strictly between 0 and 1")
+
+        # --- Design resolution ("auto" infers from distinctive params) ---
+        des = (design or "auto").lower()
+        _aliases = {"continuous": "continuous", "d": "continuous",
+                    "prop": "prop", "proportions": "prop",
+                    "mcnemar": "mcnemar", "paired": "mcnemar",
+                    "logrank": "logrank", "survival": "logrank",
+                    "acc": "acc", "accuracy": "acc", "dx": "acc"}
+        if des == "auto":
+            if hr is not None or events is not None or pevent is not None:
+                des = "logrank"
+            elif pdisc is not None or oratio is not None:
+                des = "mcnemar"
+            elif sens is not None or spec is not None or width is not None or prev is not None:
+                des = "acc"
+            elif p1 is not None and p2 is not None:
+                des = "prop"
+            else:
+                des = "continuous"
+        elif des in _aliases:
+            des = _aliases[des]
+        else:
+            return _err("design must be auto|continuous|prop|mcnemar|logrank|acc")
+
+        def _inflate_total(nt: int) -> tuple:
+            """Dropout inflation for a total-N design (pairs/subjects)."""
+            if not dropout:
+                return nt, None
+            return int(np.ceil(nt / (1 - dropout))), nt
+
+        # --- (a) McNemar paired-proportion sizing (Miettinen normal approx) ---
+        if des == "mcnemar":
+            if calc not in ("n", "power", "detect"):
+                return _err("calc must be n, power, or detect")
+            if pdisc is None or (oratio is None and calc in ("n", "power")):
+                return _err("design=mcnemar needs pdisc (discordant-pair proportion) + oratio (discordant odds ratio); calc=detect needs pdisc + n")
+            if not (0 < pdisc < 1):
+                return _err("pdisc must be a proportion strictly between 0 and 1")
+            z_a = float(sps.norm.ppf(1 - alpha / 2))
+            z_b = float(sps.norm.ppf(power))
+            ors = dd = None
+            v0, v1 = pdisc, pdisc
+            if calc in ("n", "power"):
+                if not (oratio > 0):
+                    return _err("oratio must be a positive odds ratio (!= 1)")
+                if oratio == 1:
+                    return _err("oratio is 1 (no effect) — no finite sample size can detect it")
+                ors = float(oratio) if oratio > 1 else 1.0 / float(oratio)  # sizing symmetric in 1/OR
+                dd = pdisc * (ors - 1) / (ors + 1)  # |p01-p10|
+                v0, v1 = pdisc, pdisc - dd * dd
+                if v1 <= 0:
+                    return _err("pdisc/oratio combination gives zero variance — check inputs")
+
+            def _mcnemar_power(n_pairs: int, or_: float) -> float:
+                o = or_ if or_ > 1 else 1.0 / or_
+                d_ = pdisc * (o - 1) / (o + 1)
+                v_ = pdisc - d_ * d_
+                zb = (d_ * np.sqrt(n_pairs) - z_a * np.sqrt(pdisc)) / np.sqrt(v_)
+                return float(sps.norm.cdf(zb))
+
+            def _or_ci(or_: float, m_disc: float) -> Optional[list]:
+                o = or_ if or_ > 1 else 1.0 / or_
+                if m_disc < 1:
+                    return None
+                c = m_disc / (1 + o)
+                b = m_disc - c
+                if b <= 0 or c <= 0:
+                    return None
+                se = (1 / b + 1 / c) ** 0.5
+                lo = o * math.exp(-z_a * se)
+                hi = o * math.exp(z_a * se)
+                return [round(lo, 3), round(hi, 3)]
+
+            if calc == "n":
+                n_raw = int(np.ceil((z_a * np.sqrt(v0) + z_b * np.sqrt(v1)) ** 2 / dd ** 2))
+                n_raw = max(n_raw, 2)
+                m_disc = int(np.ceil(n_raw * pdisc))
+                adj, before = _inflate_total(n_raw)
+                return _ok({
+                    "t": "mcnemar", "calc": "n",
+                    "pdisc": pdisc, "oratio": oratio,
+                    "or_ci": _or_ci(float(oratio), m_disc),
+                    "n_pairs": adj, "n_discordant": m_disc,
+                    "n_pairs_before_dropout": before,
+                    "dropout": dropout or None,
+                    "alpha": alpha, "power": power,
+                })
+            n_pairs = int(n or effect)
+            if n_pairs < 2:
+                return _err("n (total pairs) must be >= 2 for a McNemar calculation")
+            if calc == "power":
+                pw = _mcnemar_power(n_pairs, float(oratio))
+                return _ok({"t": "mcnemar", "calc": "power", "n_pairs": n_pairs,
+                            "pdisc": pdisc, "oratio": oratio,
+                            "or_ci": _or_ci(float(oratio), n_pairs * pdisc),
+                            "p": round(pw, 4), "alpha": alpha})
+            # detect: smallest OR > 1 reaching target power (bisection)
+            lo, hi = 1.0 + 1e-6, 1e4
+            if _mcnemar_power(n_pairs, hi) < power:
+                return _err(f"underpowered at n_pairs={n_pairs}: even OR={hi:g} misses power={power}")
+            for _ in range(80):
+                mid = (lo + hi) / 2
+                if _mcnemar_power(n_pairs, mid) < power:
+                    lo = mid
+                else:
+                    hi = mid
+            det = (lo + hi) / 2
+            return _ok({"t": "mcnemar", "calc": "detect", "n_pairs": n_pairs,
+                        "pdisc": pdisc, "oratio": round(float(det), 4),
+                        "or_ci": _or_ci(float(det), n_pairs * pdisc),
+                        "alpha": alpha, "power": power})
+
+        # --- (b) Log-rank survival sizing (Schoenfeld / Freedman events) ---
+        if des == "logrank":
+            if calc not in ("n", "power"):
+                return _err("calc must be n or power for design=logrank")
+            meth = (method or "schoenfeld").lower()
+            if meth not in ("schoenfeld", "freedman"):
+                return _err("method must be schoenfeld or freedman")
+            if hr is None:
+                return _err("design=logrank needs hr (hazard ratio)")
+            if not (hr > 0):
+                return _err("hr must be a positive hazard ratio (!= 1)")
+            if hr == 1:
+                return _err("hr is 1 (no effect) — no finite sample size can detect it")
+            if not (ratio > 0):
+                return _err("ratio must be positive")
+            q = 1.0 / (1.0 + ratio)
+            q1q = q * (1 - q)
+            z_a = float(sps.norm.ppf(1 - alpha / 2))
+            z_b = float(sps.norm.ppf(power))
+            lhr = float(np.log(hr))
+            denom = abs(lhr) if meth == "schoenfeld" else abs(2.0 * (hr - 1.0) / (hr + 1.0))
+
+            def _hr_ci(ev: float) -> Optional[list]:
+                if ev <= 0:
+                    return None
+                se = 1.0 / (ev * q1q) ** 0.5
+                return [round(float(np.exp(lhr - z_a * se)), 3),
+                        round(float(np.exp(lhr + z_a * se)), 3)]
+
+            if calc == "n":
+                ev = max(int(np.ceil((z_a + z_b) ** 2 / (q1q * denom ** 2))), 1)
+                out = {"t": "logrank", "calc": "n", "method": meth,
+                       "hr": hr, "hr_ci": _hr_ci(ev), "events": ev,
+                       "alpha": alpha, "power": power, "ratio": ratio}
+                if pevent is None:
+                    out["note"] = "pass pevent (overall event probability) for total N"
+                    return _ok(out)
+                if not (0 < pevent <= 1):
+                    return _err("pevent must be a probability in (0, 1]")
+                n_raw = max(int(np.ceil(ev / pevent)), 1)
+                adj, before = _inflate_total(n_raw)
+                out.update({"pevent": pevent, "n_total": adj,
+                            "n_total_before_dropout": before,
+                            "dropout": dropout or None})
+                return _ok(out)
+            # calc == "power"
+            if events is not None:
+                ev_use = float(events)
+            elif n is not None and pevent is not None:
+                if not (0 < pevent <= 1):
+                    return _err("pevent must be a probability in (0, 1]")
+                ev_use = float(n) * float(pevent)
+            else:
+                return _err("design=logrank power needs events (or n+pevent for expected events)")
+            if ev_use <= 0:
+                return _err("events must be positive")
+            pw = float(sps.norm.cdf(denom * np.sqrt(ev_use * q1q) - z_a))
+            ev_rep = int(ev_use) if float(ev_use).is_integer() else round(ev_use, 1)
+            return _ok({"t": "logrank", "calc": "power", "method": meth,
+                        "hr": hr, "hr_ci": _hr_ci(ev_use), "events": ev_rep,
+                        "p": round(pw, 4), "alpha": alpha, "ratio": ratio})
+
+        # --- (c) Diagnostic-accuracy sizing (Wald normal approx) ---
+        if des == "acc":
+            if calc != "n":
+                return _err("calc must be n for design=acc")
+            if width is None or prev is None or (sens is None and spec is None):
+                return _err("design=acc needs width (CI half-width) + prev (prevalence) + sens and/or spec")
+            if not (0 < width < 1):
+                return _err("width must be a CI half-width strictly between 0 and 1")
+            if not (0 < prev < 1):
+                return _err("prev must be a prevalence strictly between 0 and 1")
+            for _nm, _v in (("sens", sens), ("spec", spec)):
+                if _v is not None and not (0 < _v < 1):
+                    return _err(f"{_nm} must be strictly between 0 and 1")
+            z = float(sps.norm.ppf(1 - alpha / 2))
+            out = {"t": "accuracy", "calc": "n", "width": width,
+                   "prev": prev, "alpha": alpha, "power": None}
+            warns = []
+            totals = {}
+            if sens is not None:
+                n_se = max(int(np.ceil(z * z * sens * (1 - sens) / (width * width))), 1)
+                n_tot_se = int(np.ceil(n_se / prev))
+                out.update({"sens": sens, "n_diseased": n_se, "n_total_sens": n_tot_se,
+                            "sens_ci": [round(max(0.0, sens - width), 4),
+                                        round(min(1.0, sens + width), 4)]})
+                totals["sens"] = n_tot_se
+                if sens - width < 0 or sens + width > 1:
+                    warns.append("sens+-width leaves (0,1) — Wald approx strained near the boundary")
+            if spec is not None:
+                n_sp = max(int(np.ceil(z * z * spec * (1 - spec) / (width * width))), 1)
+                n_tot_sp = int(np.ceil(n_sp / (1 - prev)))
+                out.update({"spec": spec, "n_nondiseased": n_sp, "n_total_spec": n_tot_sp,
+                            "spec_ci": [round(max(0.0, spec - width), 4),
+                                        round(min(1.0, spec + width), 4)]})
+                totals["spec"] = n_tot_sp
+                if spec - width < 0 or spec + width > 1:
+                    warns.append("spec+-width leaves (0,1) — Wald approx strained near the boundary")
+            n_raw = max(totals.values())
+            adj, before = _inflate_total(n_raw)
+            out["n_total"] = adj
+            out["n_total_before_dropout"] = before
+            out["dropout"] = dropout or None
+            if len(totals) == 2:
+                out["driven_by"] = "sens" if totals["sens"] >= totals["spec"] else "spec"
+            if warns:
+                out["warn"] = "; ".join(warns)
+            return _ok(out)
 
         # For proportions
         if p1 is not None and p2 is not None:
@@ -1094,9 +1350,10 @@ MED_TRIAL_SCHEMA = {
 MED_POWER_SCHEMA = {
     "name": "med_power",
     "description": (
-        "Sample size/power for medical studies. calc=n (n needed)|power (power given n)|detect (detectable effect). "
-        "effect=Cohen's d (0.2/0.5/0.8), or n per group when n is omitted. For proportions set p1+p2 (arcsin). "
-        "n=per-group n for calc=power/detect. dropout=expected attrition (0.15) inflates n. ratio=n2/n1."
+        "Sample size/power for medical studies. calc=n|power|detect. "
+        "design=auto|continuous|prop|mcnemar|logrank|acc (auto infers). "
+        "effect=Cohen's d; p1+p2 proportions; pdisc+oratio McNemar; hr+pevent log-rank; "
+        "sens/spec+width+prev accuracy. n=per-group (pairs/total for mcnemar/logrank). dropout inflates n."
     ),
     "parameters": {
         "type": "object",
@@ -1136,6 +1393,50 @@ MED_POWER_SCHEMA = {
             "p2": {
                 "type": "number",
                 "description": "Proportion in group 2 (for proportion tests)",
+            },
+            "design": {
+                "type": "string",
+                "description": "Design: auto|continuous|prop|mcnemar|logrank|acc (auto infers from params)",
+            },
+            "pdisc": {
+                "type": "number",
+                "description": "McNemar: discordant-pair proportion (p01+p10)",
+            },
+            "oratio": {
+                "type": "number",
+                "description": "McNemar: discordant odds ratio (>0, !=1)",
+            },
+            "hr": {
+                "type": "number",
+                "description": "Log-rank: hazard ratio (!=1)",
+            },
+            "pevent": {
+                "type": "number",
+                "description": "Log-rank: overall event probability (events→total N)",
+            },
+            "events": {
+                "type": "integer",
+                "description": "Log-rank power: observed events (or pass n+pevent)",
+            },
+            "method": {
+                "type": "string",
+                "description": "Log-rank events: schoenfeld|freedman (default schoenfeld)",
+            },
+            "sens": {
+                "type": "number",
+                "description": "Accuracy: expected sensitivity",
+            },
+            "spec": {
+                "type": "number",
+                "description": "Accuracy: expected specificity",
+            },
+            "width": {
+                "type": "number",
+                "description": "Accuracy: target CI half-width (e.g. 0.05)",
+            },
+            "prev": {
+                "type": "number",
+                "description": "Accuracy: disease prevalence",
             },
         },
         "required": ["calc"],
@@ -1259,6 +1560,17 @@ registry.register(
         p2=args.get("p2"),
         n=args.get("n"),
         dropout=args.get("dropout", 0.0),
+        design=args.get("design", "auto"),
+        pdisc=args.get("pdisc"),
+        oratio=args.get("oratio"),
+        hr=args.get("hr"),
+        pevent=args.get("pevent"),
+        events=args.get("events"),
+        method=args.get("method", "schoenfeld"),
+        sens=args.get("sens"),
+        spec=args.get("spec"),
+        width=args.get("width"),
+        prev=args.get("prev"),
     ),
     check_fn=_check_power,
     emoji="📐",
