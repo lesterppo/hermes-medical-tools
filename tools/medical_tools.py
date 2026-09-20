@@ -14,6 +14,7 @@ Output per call: typically 200-600 chars of JSON.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import time
@@ -187,8 +188,22 @@ def med_stats(
             return _err("a must be a non-empty list of numbers (or pass categorical=[[a,b],[c,d]])")
 
         # --- Continuous tests ---
-        x = np.array(a, dtype=float)
-        y = np.array(b, dtype=float) if b is not None else None
+        # Multi-group anova/kw pass a=[[g1],[g2],...] with UNEQUAL lengths
+        # (the normal case). np.array() on ragged lists raises, so detect
+        # the nested form first and skip the flat conversion.
+        _is_multi = (test in ("anova", "kw") and isinstance(a, list)
+                     and len(a) > 0 and isinstance(a[0], list))
+        x = None
+        y = None
+        if not _is_multi:
+            try:
+                x = np.array(a, dtype=float)
+            except (ValueError, TypeError):
+                return _err("a must be a list of numbers (or [[g1],[g2],...] for anova/kw)")
+            try:
+                y = np.array(b, dtype=float) if b is not None else None
+            except (ValueError, TypeError):
+                return _err("b must be a list of numbers")
 
         if test == "ttest":
             if paired:
@@ -214,12 +229,12 @@ def med_stats(
                 "m1": round(float(x.mean()), 2),
                 "m2": round(float(y.mean()), 2) if y is not None else 0,
                 "ci1": _mean_ci(x),
-                "d": round(d_val, 2) if d_val == d_val else None,
+                "d": round(d_val, 2) if math.isfinite(d_val) else None,
             }
             if y is not None:
                 res["m2_ci"] = _mean_ci(y)
                 res["md"] = round(float(x.mean() - y.mean()), 3)
-            if d_val != d_val:
+            if not math.isfinite(d_val):
                 res["warn"] = "effect size undefined (zero variance within group)"
             return _ok(res)
 
@@ -230,8 +245,10 @@ def med_stats(
                 return _err(f"Mann-Whitney needs n>=2 per group (n1={len(x)}, n2={len(y)})")
             stat, p = sps.mannwhitneyu(x, y, alternative="two-sided")
             # Rank-biserial correlation (signed: positive = a tends higher).
+            # scipy returns U for the FIRST sample, which is maximal when a
+            # dominates, so rb = 2U/(n1*n2) - 1 (not 1 - 2U/...).
             u = float(stat)
-            rb = 1 - (2 * u) / (len(x) * len(y))
+            rb = (2 * u) / (len(x) * len(y)) - 1
             return _ok({
                 "t": "mw", "u": u, "p": round(float(p), 6),
                 "n1": len(x), "n2": len(y),
@@ -591,8 +608,25 @@ def med_trial(
         if status:
             # 'active' is not a valid v2 overallStatus enum — map the
             # colloquial term to ACTIVE_NOT_RECRUITING (HTTP 400 otherwise).
-            _status_map = {"active": "ACTIVE_NOT_RECRUITING"}
-            params["filter.overallStatus"] = _status_map.get(status.lower(), status.upper())
+            # Anything outside the enum is rejected here with a clean error
+            # instead of leaking a raw HTTP 400.
+            _status_map = {
+                "recruiting": "RECRUITING",
+                "active": "ACTIVE_NOT_RECRUITING",
+                "active_not_recruiting": "ACTIVE_NOT_RECRUITING",
+                "completed": "COMPLETED",
+                "not_yet_recruiting": "NOT_YET_RECRUITING",
+                "enrolling_by_invitation": "ENROLLING_BY_INVITATION",
+                "suspended": "SUSPENDED",
+                "terminated": "TERMINATED",
+                "withdrawn": "WITHDRAWN",
+                "unknown": "UNKNOWN_STATUS",
+            }
+            key = status.lower().replace(" ", "_").replace("-", "_")
+            if key not in _status_map:
+                return _err(f"unknown status='{status}'. Use: recruiting, active, completed "
+                            f"(or not_yet_recruiting, suspended, terminated, withdrawn)")
+            params["filter.overallStatus"] = _status_map[key]
 
         url = _CLINICALTRIALS_API + "?" + urllib.parse.urlencode(params)
         req = urllib.request.Request(url, headers={
@@ -704,7 +738,16 @@ def med_power(
                 actual_power = float(sps.norm.cdf(z_power))
                 return _ok({"t": "proportions", "calc": "power", "n1": n1, "h": round(float(h), 4),
                             "p": round(actual_power, 4)})
-            return _err("calc must be n or power")
+            elif calc == "detect":
+                n1 = int(n or effect)
+                if n1 < 2:
+                    return _err("n (per group) must be >= 2 for a detectable-effect calculation")
+                z_alpha = sps.norm.ppf(1 - alpha / 2)
+                z_beta = sps.norm.ppf(power)
+                h_det = (z_alpha + z_beta) / np.sqrt(n1 / (1 + 1 / ratio))
+                return _ok({"t": "proportions", "calc": "detect", "n1": n1,
+                            "h": round(float(h_det), 4), "alpha": alpha, "power": power})
+            return _err("calc must be n, power, or detect")
 
         # For continuous (Cohen's d) — exact noncentral-t, not a normal
         # approximation: the normal approximation overstates power noticeably
@@ -775,7 +818,7 @@ def _n_for_effect(d: float, power: float, alpha: float, ratio: float) -> int:
 
     d = abs(float(d))
     if d <= 0:
-        return 2
+        raise ValueError("effect size is zero — no finite sample size can detect it")
 
     def achieved(n1: int) -> float:
         n2 = max(2, int(round(n1 * ratio)))
@@ -805,9 +848,10 @@ def med_evidence(
     tn: Optional[int] = None,
     fp: Optional[int] = None,
     fn: Optional[int] = None,
-    nnt_calc: Optional[str] = None,
     cer: Optional[float] = None,
     eer: Optional[float] = None,
+    n_c: Optional[int] = None,
+    n_e: Optional[int] = None,
 ) -> str:
     """
     Calculate evidence-based medicine metrics from a 2x2 table or event rates.
@@ -815,10 +859,13 @@ def med_evidence(
     Diagnostic metrics (use tp, tn, fp, fn):
       tp=true positives, tn=true negatives, fp=false positives, fn=false negatives
 
-    Treatment metrics (use nnt_calc, cer, eer):
-      nnt_calc: "arr" or "nnt"
+    Treatment metrics (use cer, eer):
       cer:      control event rate (proportion, e.g. 0.15 for 15%)
       eer:      experimental event rate (proportion, e.g. 0.10 for 10%)
+      n_c, n_e: real per-arm sample sizes. When BOTH are given, ARR/RR CIs
+                use them; otherwise CIs assume n=100 per arm (flagged via
+                n_assumed_per_arm so an assumed-n CI is never mistaken
+                for a real one).
     """
     try:
         # --- Diagnostic test metrics ---
@@ -881,7 +928,11 @@ def med_evidence(
             arr = cer - eer  # Absolute Risk Reduction
             rrr = arr / cer if cer > 0 else 0  # Relative Risk Reduction
             rr = eer / cer if cer > 0 else 0  # Relative Risk
-            or_val = (eer / (1 - eer)) / (cer / (1 - cer)) if cer < 1 and eer < 1 else 0
+            # Odds ratio is undefined when either arm has 0% or 100% events
+            # (division by zero in the odds) — report None, never 0.
+            or_val = None
+            if 0 < cer < 1 and 0 < eer < 1:
+                or_val = (eer / (1 - eer)) / (cer / (1 - cer))
 
             # 95% CI for ARR
             out: dict = {
@@ -890,20 +941,29 @@ def med_evidence(
                 "arr": round(arr, 4),
                 "rrr": round(rrr, 4),
                 "rr": round(rr, 3),
-                "or": round(or_val, 2),
+                "or": round(or_val, 2) if or_val is not None else None,
             }
 
-            # ARR CI: Wald on the difference of independent proportions, with the
-            # denominator implied by the rates when only rates are supplied.
-            n_eff = 100  # documented assumption: percentages behave as n=100
-            se = ((cer * (1 - cer) / n_eff) + (eer * (1 - eer) / n_eff)) ** 0.5
+            # ARR CI: Wald on the difference of independent proportions.
+            # Real per-arm n when supplied; otherwise the documented n=100
+            # assumption (percentages behave as n=100), explicitly flagged.
+            if n_c is not None and n_e is not None:
+                if n_c <= 0 or n_e <= 0:
+                    return _err("n_c and n_e must be positive sample sizes")
+                n_c_eff, n_e_eff = n_c, n_e
+                out["n_c"] = n_c
+                out["n_e"] = n_e
+            else:
+                n_c_eff = n_e_eff = 100
+                out["n_assumed_per_arm"] = 100
+            se = ((cer * (1 - cer) / n_c_eff) + (eer * (1 - eer) / n_e_eff)) ** 0.5
             out["arr_ci"] = (round(arr - 1.96 * se, 4), round(arr + 1.96 * se, 4))
-            # RR CI (Katz log method) — also an assumed n of 100 per arm.
+            # RR CI (Katz log method) on the same denominators.
             if cer > 0 and eer > 0:
-                se_lnrr = ((1 / (cer * n_eff) - 1 / n_eff) + (1 / (eer * n_eff) - 1 / n_eff)) ** 0.5
+                se_lnrr = ((1 / (cer * n_c_eff) - 1 / n_c_eff)
+                           + (1 / (eer * n_e_eff) - 1 / n_e_eff)) ** 0.5
                 out["rr_ci"] = (round(rr * pow(2.718281828, -1.96 * se_lnrr), 3),
                                 round(rr * pow(2.718281828, 1.96 * se_lnrr), 3))
-            out["n_assumed_per_arm"] = n_eff
 
             if arr > 0:
                 nnt = int(1 / arr + 0.9999)  # round up — never under-power the NNT
@@ -1102,6 +1162,12 @@ MED_EVIDENCE_SCHEMA = {
             "eer": {
                 "type": "number", "description": "Experimental Event Rate (e.g. 0.10 for 10%)",
             },
+            "n_c": {
+                "type": "integer", "description": "Real control-arm n (both n_c+n_e needed; else CI assumes n=100/arm)",
+            },
+            "n_e": {
+                "type": "integer", "description": "Real experimental-arm n",
+            },
         },
         "required": [],
     },
@@ -1209,6 +1275,8 @@ registry.register(
         fn=args.get("fn"),
         cer=args.get("cer"),
         eer=args.get("eer"),
+        n_c=args.get("n_c"),
+        n_e=args.get("n_e"),
     ),
     check_fn=_check_evidence,
     emoji="⚖️",

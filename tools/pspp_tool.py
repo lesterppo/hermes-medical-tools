@@ -44,8 +44,21 @@ def _pspp_available() -> bool:
 # Helpers
 # ═══════════════════════════════════════════════════════════════════
 
+def _sanitize(v):
+    """Recursively replace NaN/+inf floats with None for strict JSON."""
+    import math
+    if isinstance(v, float):
+        return None if (math.isnan(v) or math.isinf(v)) else v
+    if isinstance(v, dict):
+        return {k: _sanitize(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_sanitize(x) for x in v]
+    return v
+
+
 def _ok(result: dict) -> str:
-    return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(_sanitize(result), ensure_ascii=False, separators=(",", ":"),
+                      allow_nan=False, default=str)
 
 
 def _err(msg: str) -> str:
@@ -147,6 +160,8 @@ def pspp_run(
     include_syntax:  If true, include the syntax in output (for debugging)
     """
     try:
+        if not _pspp_available():
+            return _err("PSPP binary not found on PATH — install: sudo apt install pspp")
         # Build PSPP input
         lines = []
 
