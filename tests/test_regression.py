@@ -175,6 +175,43 @@ check("handler_logrank", _d.get("t") == "logrank" and _d["events"] == 247, _d)
 _d = json.loads(_h({"calc": "n", "design": "acc", "sens": 0.9, "width": 0.05, "prev": 0.2}))
 check("handler_acc", _d.get("t") == "accuracy" and _d["n_total"] == 695, _d)
 
+# 15. non-inferiority sizing (normal approx, one-sided alpha default 0.025)
+d = strict("noninf_c_n", mt.med_power(calc="n", design="noninf", margin=0.5, sd=1.0))
+check("noninf_c_vals", d and d.get("t") == "noninf" and d.get("endpoint") == "continuous"
+      and d["n1"] == 63 and d["alpha"] == 0.025 and d.get("onesided") is True
+      and "diff_ci" in d, d)
+check("noninf_auto", strict("x", mt.med_power(calc="n", margin=0.5, sd=1.0))["n1"] == 63)
+check("noninf_alias", strict("x", mt.med_power(calc="n", design="ni", margin=0.5, sd=1.0))["n1"] == 63)
+check("noninf_dropout", strict("x", mt.med_power(calc="n", design="noninf", margin=0.5, sd=1.0, dropout=0.1))["n1"] == 70)
+d = strict("noninf_b_n", mt.med_power(calc="n", design="noninf", margin=0.1, p_ctrl=0.3))
+check("noninf_b_vals", d and d.get("endpoint") == "binary" and d["n1"] == 330
+      and d["p_exp"] == 0.3 and "diff_ci" in d, d)
+_p = strict("x", mt.med_power(calc="power", design="noninf", margin=0.5, sd=1.0, n=63))["p"]
+check("noninf_c_roundtrip", abs(_p - 0.8) < 0.02, _p)
+_p = strict("x", mt.med_power(calc="power", design="noninf", margin=0.1, p_ctrl=0.3, n=330))["p"]
+check("noninf_b_roundtrip", abs(_p - 0.8) < 0.02, _p)
+_m = strict("x", mt.med_power(calc="detect", design="noninf", sd=1.0, n=63))["margin"]
+check("noninf_c_detect", abs(_m - 0.5) < 0.02, _m)
+_m = strict("x", mt.med_power(calc="detect", design="noninf", p_ctrl=0.3, n=330))["margin"]
+check("noninf_b_detect", abs(_m - 0.1) < 0.01, _m)
+check("noninf_truediff", strict("x", mt.med_power(calc="n", design="noninf", margin=0.5, sd=1.0, true_diff=0.1))["n1"] == 44)
+check("noninf_explicit_alpha", strict("x", mt.med_power(calc="n", design="noninf", margin=0.5, sd=1.0, alpha=0.05))["n1"] == 50)
+check("noninf_margin0", "e" in strict("x", mt.med_power(calc="n", design="noninf", margin=0.0, sd=1.0)))
+check("noninf_nomargin", "e" in strict("x", mt.med_power(calc="n", design="noninf", sd=1.0)))
+check("noninf_noendpoint", "e" in strict("x", mt.med_power(calc="n", design="noninf", margin=0.5)))
+check("noninf_both", "e" in strict("x", mt.med_power(calc="n", design="noninf", margin=0.5, sd=1.0, p_ctrl=0.3)))
+check("noninf_badrate", "e" in strict("x", mt.med_power(calc="n", design="noninf", margin=0.1, p_ctrl=1.5)))
+check("noninf_beyond", "e" in strict("x", mt.med_power(calc="n", design="noninf", margin=0.5, sd=1.0, true_diff=-0.5)))
+check("noninf_badrate2", "e" in strict("x", mt.med_power(calc="n", design="noninf", margin=0.1, p_ctrl=0.3, true_diff=0.8)))
+
+# 16. registry handler forwards noninf params (no dropped params)
+_d = json.loads(_h({"calc": "n", "design": "noninf", "margin": 0.5, "sd": 1.0, "true_diff": 0.0}))
+check("handler_noninf_c", _d.get("t") == "noninf" and _d["n1"] == 63 and _d["true_diff"] == 0.0, _d)
+_d = json.loads(_h({"calc": "n", "design": "noninf", "margin": 0.1, "p_ctrl": 0.3}))
+check("handler_noninf_b", _d.get("endpoint") == "binary" and _d["n1"] == 330 and _d["p_ctrl"] == 0.3, _d)
+_d = json.loads(_h({"calc": "n", "margin": 0.5, "sd": 1.0}))
+check("handler_noninf_auto", _d.get("t") == "noninf" and _d["n1"] == 63, _d)
+
 def test_regression():
     assert FAIL == 0, f"{FAIL} regression checks failed"
 

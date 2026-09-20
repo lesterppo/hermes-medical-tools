@@ -677,13 +677,17 @@ def med_power(
     calc: str,
     effect: float = 0.5,
     power: float = 0.80,
-    alpha: float = 0.05,
+    alpha: Optional[float] = None,
     ratio: float = 1.0,
     p1: Optional[float] = None,
     p2: Optional[float] = None,
     n: Optional[int] = None,
     dropout: float = 0.0,
     design: str = "auto",
+    margin: Optional[float] = None,
+    sd: Optional[float] = None,
+    true_diff: Optional[float] = None,
+    p_ctrl: Optional[float] = None,
     pdisc: Optional[float] = None,
     oratio: Optional[float] = None,
     hr: Optional[float] = None,
@@ -702,14 +706,21 @@ def med_power(
     effect:  Cohen's d (0.2 small, 0.5 medium, 0.8 large). For "detect"/legacy "power" with
              no `n`, this doubles as n per group.
     power:   target power (default 0.80)
-    alpha:   significance level (default 0.05, two-sided)
+    alpha:   significance level. Default 0.05 two-sided, except design="noninf"
+             where the default is 0.025 one-sided (conventional NI level).
     ratio:   n2/n1 ratio (default 1 for equal groups; log-rank: allocation ratio)
     p1:      proportion in group 1 (proportion tests)
     p2:      proportion in group 2 (proportion tests)
     n:       per-group n for calc="power" (exact noncentral-t power).
              McNemar: TOTAL pairs. Log-rank power: TOTAL N (needs pevent).
+             Noninf: per-group n.
     dropout: expected attrition fraction (0.15 = 15%) — inflates the required n
-    design:  "auto" (infer from params) | "continuous" | "prop" | "mcnemar" | "logrank" | "acc"
+    design:  "auto" (infer from params) | "continuous" | "prop" | "mcnemar" | "logrank" | "acc" | "noninf"
+    margin:  non-inferiority margin (>0). Continuous: mean-difference units (T-C);
+             binary: absolute risk-difference units.
+    sd:      noninf-continuous: common SD of the outcome
+    true_diff: noninf: assumed true difference T-C (default 0)
+    p_ctrl:  noninf-binary: control-arm event rate in (0,1)
 
     Clinical sizing designs (normal approximations, documented below; the
     continuous-d path stays exact noncentral-t):
@@ -726,8 +737,25 @@ def med_power(
         Wald normal approx: n_se = z^2*s(1-s)/w^2, N = n_se/prev
         (specificity: n_sp/(1-prev); both given -> max). Assumes the Wald
         interval; a warn is added when s+-w leaves (0,1).
+      noninf (non-inferiority, H0: diff <= -margin, one-sided alpha):
+        needs margin + (sd | p_ctrl); true_diff defaults to 0 (T-C).
+        Continuous: n1 = (1+1/r)*sd^2*(z_a+z_b)^2/(true_diff+margin)^2,
+          power = Phi((true_diff+margin)/SE - z_a),
+          SE = sd*sqrt(1/n1+1/n2). Assumes known-variance normality with a
+          common SD; power is a normal approximation (stated as such), unlike
+          the exact noncentral-t used for superiority continuous sizing.
+          calc="detect" bisects the smallest margin reaching target power.
+        Binary (risk-difference scale, pT = p_ctrl+true_diff):
+          n1 = (z_a+z_b)^2*[pC(1-pC)+pT(1-pT)/r]/(true_diff+margin)^2,
+          power = Phi((true_diff+margin)/SE - z_a),
+          SE = sqrt(pC(1-pC)/n1+pT(1-pT)/n2). Wald unpooled normal approx
+          under the alternative (stated as such); the constrained
+          Farrington-Manning variance is NOT used. calc="detect" bisects margin.
+        Boundary validation: margin > 0, sd > 0, p_ctrl and implied pT in
+        (0,1), true_diff+margin > 0 (else no finite n).
     Effect+CI style: sizing outputs carry the expected 95% CI
-    (McNemar discordant-OR log CI; log-rank HR CI; accuracy Wald band).
+    (McNemar discordant-OR log CI; log-rank HR CI; accuracy Wald band;
+    noninf expected two-sided 95% CI of the true difference at the sized n).
     """
     try:
         from scipy import stats as sps
@@ -745,7 +773,7 @@ def med_power(
 
         if not (0 < float(power) < 1):
             return _err("power must be strictly between 0 and 1")
-        if not (0 < float(alpha) < 1):
+        if alpha is not None and not (0 < float(alpha) < 1):
             return _err("alpha must be strictly between 0 and 1")
 
         # --- Design resolution ("auto" infers from distinctive params) ---
@@ -754,9 +782,13 @@ def med_power(
                     "prop": "prop", "proportions": "prop",
                     "mcnemar": "mcnemar", "paired": "mcnemar",
                     "logrank": "logrank", "survival": "logrank",
-                    "acc": "acc", "accuracy": "acc", "dx": "acc"}
+                    "acc": "acc", "accuracy": "acc", "dx": "acc",
+                    "noninf": "noninf", "ni": "noninf",
+                    "noninferiority": "noninf", "non-inferiority": "noninf"}
         if des == "auto":
-            if hr is not None or events is not None or pevent is not None:
+            if margin is not None or sd is not None or p_ctrl is not None or true_diff is not None:
+                des = "noninf"
+            elif hr is not None or events is not None or pevent is not None:
                 des = "logrank"
             elif pdisc is not None or oratio is not None:
                 des = "mcnemar"
@@ -769,7 +801,9 @@ def med_power(
         elif des in _aliases:
             des = _aliases[des]
         else:
-            return _err("design must be auto|continuous|prop|mcnemar|logrank|acc")
+            return _err("design must be auto|continuous|prop|mcnemar|logrank|acc|noninf")
+        # One-sided conventional default for NI; two-sided 0.05 elsewhere.
+        alpha = float(alpha) if alpha is not None else (0.025 if des == "noninf" else 0.05)
 
         def _inflate_total(nt: int) -> tuple:
             """Dropout inflation for a total-N design (pairs/subjects)."""
@@ -967,6 +1001,153 @@ def med_power(
             if warns:
                 out["warn"] = "; ".join(warns)
             return _ok(out)
+
+        # --- (d) Non-inferiority sizing (normal approximation, one-sided) ---
+        if des == "noninf":
+            if calc not in ("n", "power", "detect"):
+                return _err("calc must be n, power, or detect")
+            if margin is None and calc in ("n", "power"):
+                return _err("design=noninf needs margin (NI margin > 0) + sd (continuous) or p_ctrl (binary); true_diff defaults to 0")
+            mg = None if margin is None else float(margin)
+            if mg is not None and not (mg > 0):
+                return _err("margin must be a positive NI margin (> 0)")
+            td = 0.0 if true_diff is None else float(true_diff)
+            if mg is not None and not (td + mg > 0):
+                return _err("true_diff+margin must be positive (true diff at/beyond the margin — no finite n)")
+            if not (ratio > 0):
+                return _err("ratio must be positive")
+            is_cont = sd is not None
+            is_bin = p_ctrl is not None
+            if is_cont and is_bin:
+                return _err("design=noninf: pass sd (continuous) OR p_ctrl (binary), not both")
+            if not is_cont and not is_bin:
+                return _err("design=noninf needs sd (continuous endpoint) or p_ctrl (binary endpoint)")
+            z_a = float(sps.norm.ppf(1 - alpha))
+            z_b = float(sps.norm.ppf(power))
+            z_95 = float(sps.norm.ppf(0.975))
+
+            def _ni_ci(se: float) -> list:
+                return [round(td - z_95 * se, 4), round(td + z_95 * se, 4)]
+
+            if is_cont:
+                sdv = float(sd)
+                if not (sdv > 0):
+                    return _err("sd must be a positive common standard deviation")
+                den = None if mg is None else td + mg
+
+                def _se_c(n1: int) -> float:
+                    n2 = max(2, int(round(n1 * ratio)))
+                    return sdv * float(np.sqrt(1.0 / n1 + 1.0 / n2))
+
+                def _pw_c(n1: int) -> float:
+                    return float(sps.norm.cdf(den / _se_c(n1) - z_a))
+
+                def _pw_cm(n1: int, m: float) -> float:
+                    return float(sps.norm.cdf((td + m) / _se_c(n1) - z_a))
+
+                if calc == "n":
+                    n_raw = max(int(np.ceil((1.0 + 1.0 / ratio) * sdv * sdv
+                                            * (z_a + z_b) ** 2 / den ** 2)), 2)
+                    adj, tot = _inflate(n_raw)
+                    return _ok({
+                        "t": "noninf", "endpoint": "continuous", "calc": "n",
+                        "margin": mg, "sd": sdv, "true_diff": td,
+                        "diff_ci": _ni_ci(_se_c(n_raw)),
+                        "n1": adj, "n2": round(adj * ratio), "total": tot,
+                        "n1_before_dropout": n_raw,
+                        "dropout": dropout or None,
+                        "alpha": alpha, "onesided": True, "power": power,
+                    })
+                n1 = int(n or effect)
+                if n1 < 2:
+                    return _err("n (per group) must be >= 2 for a noninf calculation")
+                if calc == "power":
+                    return _ok({"t": "noninf", "endpoint": "continuous",
+                                "calc": "power", "n1": n1,
+                                "n2": max(2, int(round(n1 * ratio))),
+                                "margin": mg, "sd": sdv, "true_diff": td,
+                                "diff_ci": _ni_ci(_se_c(n1)),
+                                "p": round(_pw_c(n1), 4),
+                                "alpha": alpha, "onesided": True})
+                # detect: bisect the smallest margin reaching target power
+                lo, hi = 1e-9, 1.0
+                while _pw_cm(n1, hi) < power:
+                    hi *= 2
+                    if hi > 1e6:
+                        return _err(f"underpowered at n1={n1}: even margin={hi:g} misses power={power}")
+                for _ in range(80):
+                    mid = (lo + hi) / 2
+                    if _pw_cm(n1, mid) < power:
+                        lo = mid
+                    else:
+                        hi = mid
+                det = (lo + hi) / 2
+                return _ok({"t": "noninf", "endpoint": "continuous",
+                            "calc": "detect", "n1": n1, "margin": round(float(det), 4),
+                            "sd": sdv, "true_diff": td,
+                            "alpha": alpha, "onesided": True, "power": power})
+
+            # binary endpoint (absolute risk-difference scale)
+            pc = float(p_ctrl)
+            if not (0 < pc < 1):
+                return _err("p_ctrl must be a control rate strictly between 0 and 1")
+            pt = pc + td
+            if not (0 < pt < 1):
+                return _err("p_ctrl+true_diff must stay strictly between 0 and 1")
+            den = None if mg is None else td + mg
+
+            def _se_b(n1: int) -> float:
+                n2 = max(2, int(round(n1 * ratio)))
+                return float(np.sqrt(pc * (1 - pc) / n1 + pt * (1 - pt) / n2))
+
+            def _pw_b(n1: int, m: float) -> float:
+                n2 = max(2, int(round(n1 * ratio)))
+                se = float(np.sqrt(pc * (1 - pc) / n1 + pt * (1 - pt) / n2))
+                return float(sps.norm.cdf((td + m) / se - z_a))
+
+            if calc == "n":
+                v1 = pc * (1 - pc) + pt * (1 - pt) / ratio
+                n_raw = max(int(np.ceil((z_a + z_b) ** 2 * v1 / den ** 2)), 2)
+                adj, tot = _inflate(n_raw)
+                return _ok({
+                    "t": "noninf", "endpoint": "binary", "calc": "n",
+                    "margin": mg, "p_ctrl": pc, "p_exp": round(pt, 4),
+                    "true_diff": td,
+                    "diff_ci": _ni_ci(_se_b(n_raw)),
+                    "n1": adj, "n2": round(adj * ratio), "total": tot,
+                    "n1_before_dropout": n_raw,
+                    "dropout": dropout or None,
+                    "alpha": alpha, "onesided": True, "power": power,
+                })
+            n1 = int(n or effect)
+            if n1 < 2:
+                return _err("n (per group) must be >= 2 for a noninf calculation")
+            if calc == "power":
+                return _ok({"t": "noninf", "endpoint": "binary",
+                            "calc": "power", "n1": n1,
+                            "n2": max(2, int(round(n1 * ratio))),
+                            "margin": mg, "p_ctrl": pc,
+                            "p_exp": round(pt, 4), "true_diff": td,
+                            "diff_ci": _ni_ci(_se_b(n1)),
+                            "p": round(_pw_b(n1, mg), 4),
+                            "alpha": alpha, "onesided": True})
+            # detect: bisect the smallest margin reaching target power
+            lo, hi = 1e-9, 1.0
+            while _pw_b(n1, hi) < power:
+                hi *= 2
+                if hi > 2.0:
+                    return _err(f"underpowered at n1={n1}: even margin={hi:g} misses power={power}")
+            for _ in range(80):
+                mid = (lo + hi) / 2
+                if _pw_b(n1, mid) < power:
+                    lo = mid
+                else:
+                    hi = mid
+            det = (lo + hi) / 2
+            return _ok({"t": "noninf", "endpoint": "binary",
+                        "calc": "detect", "n1": n1, "margin": round(float(det), 4),
+                        "p_ctrl": pc, "p_exp": round(pt, 4), "true_diff": td,
+                        "alpha": alpha, "onesided": True, "power": power})
 
         # For proportions
         if p1 is not None and p2 is not None:
@@ -1351,9 +1532,10 @@ MED_POWER_SCHEMA = {
     "name": "med_power",
     "description": (
         "Sample size/power for medical studies. calc=n|power|detect. "
-        "design=auto|continuous|prop|mcnemar|logrank|acc (auto infers). "
+        "design=auto|continuous|prop|mcnemar|logrank|acc|noninf (auto infers). "
         "effect=Cohen's d; p1+p2 proportions; pdisc+oratio McNemar; hr+pevent log-rank; "
-        "sens/spec+width+prev accuracy. n=per-group (pairs/total for mcnemar/logrank). dropout inflates n."
+        "sens/spec+width+prev accuracy; margin+sd|p_ctrl noninf (true_diff). "
+        "n=per-group (pairs/total for mcnemar/logrank). dropout inflates n."
     ),
     "parameters": {
         "type": "object",
@@ -1380,7 +1562,7 @@ MED_POWER_SCHEMA = {
             },
             "alpha": {
                 "type": "number",
-                "description": "Significance level (default 0.05, two-sided)",
+                "description": "Significance level (default 0.05 two-sided; 0.025 one-sided for noninf)",
             },
             "ratio": {
                 "type": "number",
@@ -1396,7 +1578,23 @@ MED_POWER_SCHEMA = {
             },
             "design": {
                 "type": "string",
-                "description": "Design: auto|continuous|prop|mcnemar|logrank|acc (auto infers from params)",
+                "description": "Design: auto|continuous|prop|mcnemar|logrank|acc|noninf (auto infers from params)",
+            },
+            "margin": {
+                "type": "number",
+                "description": "Noninf: NI margin (>0); mean units (sd) or risk-diff units (p_ctrl)",
+            },
+            "sd": {
+                "type": "number",
+                "description": "Noninf-continuous: common SD of the outcome",
+            },
+            "true_diff": {
+                "type": "number",
+                "description": "Noninf: assumed true T-C difference (default 0)",
+            },
+            "p_ctrl": {
+                "type": "number",
+                "description": "Noninf-binary: control-arm event rate in (0,1)",
             },
             "pdisc": {
                 "type": "number",
@@ -1554,13 +1752,17 @@ registry.register(
         calc=args.get("calc", "n"),
         effect=args.get("effect", 0.5),
         power=args.get("power", 0.80),
-        alpha=args.get("alpha", 0.05),
+        alpha=args.get("alpha"),
         ratio=args.get("ratio", 1.0),
         p1=args.get("p1"),
         p2=args.get("p2"),
         n=args.get("n"),
         dropout=args.get("dropout", 0.0),
         design=args.get("design", "auto"),
+        margin=args.get("margin"),
+        sd=args.get("sd"),
+        true_diff=args.get("true_diff"),
+        p_ctrl=args.get("p_ctrl"),
         pdisc=args.get("pdisc"),
         oratio=args.get("oratio"),
         hr=args.get("hr"),

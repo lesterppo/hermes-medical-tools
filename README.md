@@ -87,6 +87,22 @@ med_power(calc="detect", effect=0.5, n=20)               # smallest detectable d
 Power and n come from the **noncentral t** distribution (normal approximations
 overstate power at the small n typical of pilot work). `ratio` sets n2/n1.
 
+Non-inferiority (`design="noninf"`, H0: diff ≤ −margin, one-sided alpha
+default 0.025) uses stated normal approximations for both endpoints:
+
+```python
+med_power(calc="n", design="noninf", margin=0.5, sd=1.0)        # continuous: 63/group
+med_power(calc="n", design="noninf", margin=0.1, p_ctrl=0.30)   # binary risk-diff: 330/group
+med_power(calc="detect", design="noninf", sd=1.0, n=63)         # smallest winnable margin
+```
+
+Continuous: n1 = (1+1/r)·sd²·(z_a+z_b)²/(true_diff+margin)², power =
+Φ((true_diff+margin)/SE − z_a), SE = sd·√(1/n1+1/n2). Binary (risk-difference
+scale, pT = p_ctrl+true_diff): n1 =
+(z_a+z_b)²·[pC(1−pC)+pT(1−pT)/r]/(true_diff+margin)² with the analogous power.
+Wald unpooled variance under the alternative — the constrained
+Farrington-Manning variance is NOT used. `true_diff` (T−C) defaults to 0.
+
 ### med_evidence — EBM metrics
 
 ```python
