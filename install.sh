@@ -139,7 +139,7 @@ for other in "$HERMES_HOME"/plugins/*/; do
     [ -d "$other" ] || continue
     base="$(basename "$other")"
     [ "$base" = "$PLUGIN_NAME" ] && continue
-    if grep -rqs "med_pubmed\|med_evidence\|med_stats" "$other" 2>/dev/null; then
+    if grep -rqs "med_pubmed\|med_trial\|med_stats\|med_power\|med_evidence\|\"pspp\"\|'pspp'\|\"jmv\"\|'jmv'" "$other" 2>/dev/null; then
         collisions="$collisions $base"
     fi
 done

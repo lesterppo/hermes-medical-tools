@@ -41,9 +41,32 @@ def _has_pubmed() -> bool:
 # Shared helpers
 # ═══════════════════════════════════════════════════════════════════
 
+def _sanitize(v):
+    """Recursively replace NaN/±inf floats with None for strict JSON."""
+    import math
+    try:
+        import numpy as _np
+        if isinstance(v, _np.floating):
+            v = float(v)
+        elif isinstance(v, _np.integer):
+            v = int(v)
+        elif isinstance(v, _np.ndarray):
+            return [_sanitize(x) for x in v.tolist()]
+    except ImportError:
+        pass
+    if isinstance(v, float):
+        return None if (math.isnan(v) or math.isinf(v)) else v
+    if isinstance(v, dict):
+        return {k: _sanitize(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_sanitize(x) for x in v]
+    return v
+
+
 def _ok(result: dict) -> str:
     """Wrap result dict as compact JSON. No newlines, minimal whitespace."""
-    return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(_sanitize(result), ensure_ascii=False, separators=(",", ":"),
+                      allow_nan=False, default=str)
 
 
 def _err(msg: str) -> str:
@@ -206,7 +229,7 @@ def med_stats(
             if len(x) < 2 or len(y) < 2:
                 return _err(f"Mann-Whitney needs n>=2 per group (n1={len(x)}, n2={len(y)})")
             stat, p = sps.mannwhitneyu(x, y, alternative="two-sided")
-            # Rank-biserial correlation is the standard effect size for MWU.
+            # Rank-biserial correlation (signed: positive = a tends higher).
             u = float(stat)
             rb = 1 - (2 * u) / (len(x) * len(y))
             return _ok({
@@ -214,7 +237,7 @@ def med_stats(
                 "n1": len(x), "n2": len(y),
                 "md1": round(float(np.median(x)), 2),
                 "md2": round(float(np.median(y)), 2),
-                "rb": round(abs(rb), 3),
+                "rb": round(rb, 3),
             })
 
         elif test == "wilcoxon":
@@ -405,7 +428,7 @@ def med_pubmed(
                 return _ok({"pmid": pmid, "e": "not found"})
 
             title_el = article.find(".//ArticleTitle")
-            title = title_el.text if title_el is not None and title_el.text else ""
+            title = "".join(title_el.itertext()).strip() if title_el is not None else ""
             # Join ALL AbstractText nodes — structured abstracts
             # (Background/Methods/Results/Conclusions) have several.
             abstract_parts = []
@@ -500,7 +523,7 @@ def med_pubmed(
                 pid_el = art.find(".//PMID")
                 pid = pid_el.text if pid_el is not None else ""
                 title_el = art.find(".//ArticleTitle")
-                title = title_el.text[:300] if title_el is not None and title_el.text else ""
+                title = "".join(title_el.itertext()).strip()[:300] if title_el is not None else ""
                 ab_parts = []
                 for ab_el in art.findall(".//AbstractText"):
                     label = ab_el.get("Label")
@@ -566,7 +589,10 @@ def med_trial(
             "countTotal": "true",
         }
         if status:
-            params["filter.overallStatus"] = status.upper()
+            # 'active' is not a valid v2 overallStatus enum — map the
+            # colloquial term to ACTIVE_NOT_RECRUITING (HTTP 400 otherwise).
+            _status_map = {"active": "ACTIVE_NOT_RECRUITING"}
+            params["filter.overallStatus"] = _status_map.get(status.lower(), status.upper())
 
         url = _CLINICALTRIALS_API + "?" + urllib.parse.urlencode(params)
         req = urllib.request.Request(url, headers={
@@ -741,10 +767,13 @@ def _n_for_effect(d: float, power: float, alpha: float, ratio: float) -> int:
 
     Exact solution: bisection on the noncentral-t distribution (the closed-form
     normal approximation under-states the n needed for small effects).
+    Uses abs(d): Cohen's h/d is signed but sample size depends on magnitude
+    (negative d previously returned n=2 — a dangerous under-powering bug).
     """
     import numpy as np
     from scipy import stats as sps
 
+    d = abs(float(d))
     if d <= 0:
         return 2
 
@@ -991,7 +1020,7 @@ MED_TRIAL_SCHEMA = {
             },
             "status": {
                 "type": "string",
-                "description": "Filter: recruiting, active, completed. Omit for all.",
+                "description": "Filter: recruiting, active (=ACTIVE_NOT_RECRUITING), completed. Omit for all.",
             },
             "fmt": {
                 "type": "string",
@@ -1162,6 +1191,8 @@ registry.register(
         ratio=args.get("ratio", 1.0),
         p1=args.get("p1"),
         p2=args.get("p2"),
+        n=args.get("n"),
+        dropout=args.get("dropout", 0.0),
     ),
     check_fn=_check_power,
     emoji="📐",
